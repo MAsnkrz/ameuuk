@@ -56,7 +56,7 @@ DEALS_SELECTION_TEMPLATE = {
     "isFilterEnabled": True,
     "isFBASupported": True,
     "sortType": 4,               # sort by biggest % drop
-    "perPage": 150,
+    "perPage": 50,
 }
 
 # Since Amazon applies UK VAT (OSS) on EU cross-border sales to your UK VAT
@@ -97,11 +97,24 @@ def save_state(state):
 # KEEPA CALLS
 # ---------------------------------------------------------------------------
 
-def keepa_get(path, params):
+def keepa_get(path, params, retries=3):
     params = {**params, "key": KEEPA_API_KEY}
-    r = requests.get(f"{KEEPA_BASE}/{path}", params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(retries):
+        r = requests.get(f"{KEEPA_BASE}/{path}", params=params, timeout=30)
+        if r.status_code == 429:
+            wait = 60 * (attempt + 1)
+            print(f"  [429] Rate limited, waiting {wait}s before retry...")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        data = r.json()
+        # Keepa returns tokensLeft in every response - throttle proactively
+        tokens_left = data.get("tokensLeft")
+        if tokens_left is not None and tokens_left < 20:
+            print(f"  [!] Low tokens ({tokens_left}), pausing 30s to let them refill...")
+            time.sleep(30)
+        return data
+    raise requests.exceptions.HTTPError(f"429 persisted after {retries} retries on {path}")
 
 def fetch_deals(domain_id):
     selection = dict(DEALS_SELECTION_TEMPLATE)
@@ -374,8 +387,11 @@ def main():
             process_country(country, domain_id, state)
         except Exception as e:
             print(f"[{country}] ERROR: {e}")
+        save_state(state)  # persist after each country in case a later one fails
+        time.sleep(15)  # spread load across the run rather than bursting
     save_state(state)
 
 
 if __name__ == "__main__":
     main()
+
