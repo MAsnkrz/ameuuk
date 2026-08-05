@@ -76,9 +76,15 @@ REFERRAL_FEE_RATE = 0.15     # most categories; override per-category if needed
 FBA_FEE_FLAT_ESTIMATE = 3.50 # £, small-standard placeholder — refine per ASIN/size tier
 
 # Profitability thresholds — mirror your existing filters
-MIN_PROFIT_GBP = 3.00
+MIN_PROFIT_GBP = 2.00
 MIN_ROI_PCT = 20.0
 MIN_MARGIN_PCT = 10.0
+
+# Set to True for a one-off test run: fires a real Discord alert on the FIRST
+# evaluated deal regardless of whether it passes the profit filters, then
+# stops. Use this to confirm the whole pipeline works end-to-end without
+# waiting for a genuine profitable match. Set back to False for real runs.
+DEBUG_FORCE_ALERT = os.environ.get("DEBUG_FORCE_ALERT", "false").lower() == "true"
 
 # FX buffer applied to EUR->GBP conversion to protect against rate swings
 FX_BUFFER_PCT = 1.5
@@ -335,6 +341,7 @@ DOMAIN_TLD = {"France": "fr", "Germany": "de", "Italy": "it", "Spain": "es"}
 # ---------------------------------------------------------------------------
 
 def process_country(country, domain_id, state):
+    """Returns True if DEBUG_FORCE_ALERT fired during this call."""
     print(f"[{country}] fetching deals...")
     deals = fetch_deals(domain_id)
     print(f"[{country}] {len(deals)} deals returned, processing up to {MAX_DEALS_PER_COUNTRY}")
@@ -374,11 +381,22 @@ def process_country(country, domain_id, state):
 
             calc = calc_profit(buy_price, uk_sell_price)
 
-            if (calc["profit"] >= MIN_PROFIT_GBP
-                    and calc["roi_pct"] >= MIN_ROI_PCT
-                    and calc["margin_pct"] >= MIN_MARGIN_PCT):
-                print(f"  MATCH: {source_product.get('title','')[:60]} "
-                      f"profit=£{calc['profit']} roi={calc['roi_pct']}%")
+            # Always log what was evaluated, pass or fail - this is what lets
+            # you see WHY nothing is alerting (too-low margin, near misses,
+            # etc.) instead of just silence.
+            title_short = source_product.get("title", "")[:55]
+            print(f"  eval: {title_short} | buy=£{calc['buy_gbp_net']} "
+                  f"sell=£{calc['sell_gbp_gross']} profit=£{calc['profit']} "
+                  f"roi={calc['roi_pct']}% margin={calc['margin_pct']}%")
+
+            passes = (calc["profit"] >= MIN_PROFIT_GBP
+                      and calc["roi_pct"] >= MIN_ROI_PCT
+                      and calc["margin_pct"] >= MIN_MARGIN_PCT)
+
+            if passes or DEBUG_FORCE_ALERT:
+                if not passes:
+                    print("  [DEBUG_FORCE_ALERT] sending despite failing filters")
+                print(f"  MATCH: {title_short} profit=£{calc['profit']} roi={calc['roi_pct']}%")
                 send_discord_alert(country, source_product, uk_product, calc, ean)
                 state[state_key] = {
                     "buy_price": buy_price,
@@ -387,8 +405,12 @@ def process_country(country, domain_id, state):
                     "profit": calc["profit"],
                     "roi_pct": calc["roi_pct"],
                 }
+                if DEBUG_FORCE_ALERT:
+                    return True  # only fire the one forced test alert per run
 
         time.sleep(1)  # be gentle on token budget / rate limits
+
+    return False
 
 
 def main():
@@ -399,6 +421,9 @@ def main():
         except Exception as e:
             print(f"[{country}] ERROR: {e}")
         save_state(state)  # persist after each country in case a later one fails
+        if DEBUG_FORCE_ALERT and any(state.values()):
+            print("[DEBUG_FORCE_ALERT] test alert sent, stopping run early.")
+            break
         time.sleep(15)  # spread load across the run rather than bursting
     save_state(state)
 
