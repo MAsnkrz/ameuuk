@@ -36,6 +36,13 @@ from urllib.parse import quote
 KEEPA_API_KEY = os.environ["KEEPA_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
+if not DISCORD_WEBHOOK_URL or not DISCORD_WEBHOOK_URL.startswith("http"):
+    raise SystemExit(
+        "DISCORD_WEBHOOK_URL is empty or invalid. Check the repo secret "
+        "(Settings -> Secrets and variables -> Actions) actually contains "
+        "your current webhook URL, with no leading/trailing whitespace."
+    )
+
 api = keepa.Keepa(KEEPA_API_KEY)
 
 DOMAIN_UK = "GB"
@@ -80,9 +87,15 @@ REFERRAL_FEE_RATE = 0.15     # most categories; override per-category if needed
 FBA_FEE_FLAT_ESTIMATE = 3.50 # £, small-standard placeholder — refine per ASIN/size tier
 
 # Profitability thresholds — mirror your existing filters
-MIN_PROFIT_GBP = 3.00
+MIN_PROFIT_GBP = 2.00
 MIN_ROI_PCT = 20.0
 MIN_MARGIN_PCT = 10.0
+
+# Only alert if the UK listing has between this many active New sellers -
+# too few (0-1) often means low demand or an Amazon-only listing; too many
+# means a race-to-the-bottom price war that'll erode margin fast.
+MIN_SELLERS = 2
+MAX_SELLERS = 10
 
 # Set to True for a one-off test run: fires a real Discord alert on the FIRST
 # evaluated deal regardless of whether it passes the profit filters, then
@@ -124,7 +137,7 @@ def fetch_product_by_asin(asin, domain):
 
 def fetch_products_by_code(code, domain):
     """Look up product(s) by EAN/UPC/GTIN on a given marketplace."""
-    products = api.query(code, domain=domain, stats=90, history=False,
+    products = api.query(code, domain=domain, stats=90, history=False, offers=20,
                           product_code_is_asin=False, wait=True, progress_bar=False)
     return products
 
@@ -163,6 +176,19 @@ def get_avg_price(product):
 def get_primary_ean(product):
     eans = product.get("eanList") or []
     return eans[0] if eans else None
+
+def get_seller_count(product):
+    """Number of active New offers on the listing (competition check)."""
+    stats = product.get("stats") or {}
+    current = stats.get("current") or {}
+    if isinstance(current, dict):
+        count = current.get("COUNT_NEW")
+        if count is not None and count >= 0:
+            return int(count)
+    offers = product.get("offers")
+    if offers:
+        return len(offers)
+    return None
 
 # ---------------------------------------------------------------------------
 # FX (simple, cached per run)
@@ -245,7 +271,7 @@ def fetch_graph_image_bytes(asin, domain):
         print(f"  [!] Graph image fetch failed for {asin}: {e}")
         return None
 
-def send_discord_alert(country, source_product, uk_product, calc, ean):
+def send_discord_alert(country, source_product, uk_product, calc, ean, seller_count=None):
     title = source_product.get("title", "Unknown product")
     source_asin = source_product.get("asin")
     uk_asin = uk_product.get("asin")
@@ -263,6 +289,7 @@ def send_discord_alert(country, source_product, uk_product, calc, ean):
             {"name": "Profit", "value": f"£{calc['profit']}", "inline": True},
             {"name": "ROI", "value": f"{calc['roi_pct']}%", "inline": True},
             {"name": "Margin", "value": f"{calc['margin_pct']}%", "inline": True},
+            {"name": "UK Sellers", "value": str(seller_count) if seller_count is not None else "?", "inline": True},
             spacer,
             {"name": "Source ASIN", "value": f"`{source_asin}`", "inline": True},
             {"name": "UK ASIN", "value": f"`{uk_asin}`", "inline": True},
@@ -341,21 +368,27 @@ def process_country(country, domain, state):
                 continue
 
             calc = calc_profit(buy_price, uk_sell_price)
+            seller_count = get_seller_count(uk_product)
 
             title_short = source_product.get("title", "")[:55]
             print(f"  eval: {title_short} | buy=£{calc['buy_gbp_net']} "
                   f"sell=£{calc['sell_gbp_gross']} profit=£{calc['profit']} "
-                  f"roi={calc['roi_pct']}% margin={calc['margin_pct']}%")
+                  f"roi={calc['roi_pct']}% margin={calc['margin_pct']}% "
+                  f"sellers={seller_count}")
+
+            sellers_ok = (seller_count is not None
+                          and MIN_SELLERS <= seller_count <= MAX_SELLERS)
 
             passes = (calc["profit"] >= MIN_PROFIT_GBP
                       and calc["roi_pct"] >= MIN_ROI_PCT
-                      and calc["margin_pct"] >= MIN_MARGIN_PCT)
+                      and calc["margin_pct"] >= MIN_MARGIN_PCT
+                      and sellers_ok)
 
             if passes or DEBUG_FORCE_ALERT:
                 if not passes:
                     print("  [DEBUG_FORCE_ALERT] sending despite failing filters")
-                print(f"  MATCH: {title_short} profit=£{calc['profit']} roi={calc['roi_pct']}%")
-                send_discord_alert(country, source_product, uk_product, calc, ean)
+                print(f"  MATCH: {title_short} profit=£{calc['profit']} roi={calc['roi_pct']}% sellers={seller_count}")
+                send_discord_alert(country, source_product, uk_product, calc, ean, seller_count)
                 state[state_key] = {
                     "buy_price": buy_price,
                     "uk_asin": uk_product.get("asin"),
