@@ -97,6 +97,26 @@ MIN_MARGIN_PCT = 10.0
 MIN_SELLERS = 2
 MAX_SELLERS = 10
 
+# Minimum "bought in past month" figure Amazon shows on the UK listing -
+# filters out low-velocity items even if the margin looks good on paper.
+MIN_MONTHLY_SOLD = 50
+
+# Only alert on UK listings in these root categories. Matched against the
+# UK product's own category tree (name-based, not ID-based, since category
+# IDs differ per marketplace but the UK product data gives us clean names).
+# A few common name variants are included per category to be safe.
+ALLOWED_ROOT_CATEGORIES = {
+    "health & personal care", "health and personal care",
+    "baby products", "baby",
+    "automotive", "car & motorbike", "car and motorbike",
+    "beauty",
+    "home & garden", "home and garden", "garden & outdoors", "garden and outdoors", "home",
+    "pc & video games", "pc and video games", "video games",
+    "grocery",
+    "toys & games", "toys and games", "toys",
+    "office products", "stationery & office supplies", "stationery and office supplies",
+}
+
 # Set to True for a one-off test run: fires a real Discord alert on the FIRST
 # evaluated deal regardless of whether it passes the profit filters, then
 # stops. Use this to confirm the whole pipeline works end-to-end without
@@ -159,6 +179,26 @@ def get_current_buybox_price(product):
                 return round(current[idx] / 100, 2)
     return None
 
+def get_strict_buybox_price(product):
+    """
+    UK sell price MUST come from an actual, currently-active buy box - no
+    fallback to NEW/AMAZON/avg. A missing buy box usually means no one is
+    actively selling it right now, which was producing nonsense profit
+    numbers (e.g. a stale/low historical price with no real seller behind it).
+    Returns None if there's no live buy box, meaning the deal should be
+    skipped rather than evaluated on unreliable data.
+    """
+    stats = product.get("stats") or {}
+    current = stats.get("current") or {}
+    if isinstance(current, dict):
+        val = current.get("BUY_BOX_SHIPPING")
+        if val is not None and val >= 0:
+            return round(val / 100, 2) if val > 1000 else round(val, 2)
+    elif isinstance(current, list):
+        if len(current) > 18 and current[18] and current[18] > 0:
+            return round(current[18] / 100, 2)
+    return None
+
 def get_avg_price(product):
     stats = product.get("stats") or {}
     avg = stats.get("avg90") or {}
@@ -176,6 +216,23 @@ def get_avg_price(product):
 def get_primary_ean(product):
     eans = product.get("eanList") or []
     return eans[0] if eans else None
+
+def get_root_category_name(product):
+    """
+    Root category name from the product's category tree, if Keepa has it.
+    Returns None if unavailable.
+    """
+    tree = product.get("categoryTree")
+    if tree and isinstance(tree, list) and len(tree) > 0:
+        first = tree[0]
+        if isinstance(first, dict):
+            return first.get("name")
+    return None
+
+def get_monthly_sold(product):
+    """Amazon's 'bought in past month' badge, if Keepa has captured it."""
+    val = product.get("monthlySold")
+    return int(val) if val is not None and val >= 0 else None
 
 def get_seller_count(product):
     """Number of active New offers on the listing (competition check)."""
@@ -247,31 +304,55 @@ def sas_title(title, cost_inc):
     return f"https://sas.selleramp.com/sas/lookup/?search_term={quote(title)}&sas_cost_price={cost_inc:.2f}"
 
 def get_thumbnail_url(product):
-    """Build an Amazon image CDN URL from Keepa's imagesCSV field."""
+    """
+    Build an Amazon image CDN URL from whatever image field Keepa gives us.
+    The parsed dict from the keepa library can expose this a couple of
+    different ways depending on product age/type, so try each.
+    """
     images_csv = product.get("imagesCSV")
-    if not images_csv:
-        return None
-    first_image = images_csv.split(",")[0].strip()
-    if not first_image:
-        return None
-    return f"https://images-na.ssl-images-amazon.com/images/I/{first_image}"
+    if images_csv:
+        first_image = images_csv.split(",")[0].strip()
+        if first_image:
+            return f"https://images-na.ssl-images-amazon.com/images/I/{first_image}"
 
-def fetch_graph_image_bytes(asin, domain):
+    images = product.get("images")
+    if images and isinstance(images, list):
+        first = images[0]
+        if isinstance(first, dict):
+            filename = first.get("l") or first.get("large") or first.get("filename") or first.get("hiRes")
+            if filename:
+                return f"https://images-na.ssl-images-amazon.com/images/I/{filename}"
+        elif isinstance(first, str) and first:
+            return f"https://images-na.ssl-images-amazon.com/images/I/{first}"
+
+    return None
+
+def fetch_graph_image_bytes(asin, domain_id):
     """
-    Download a Keepa price-history graph PNG via the library's built-in
-    helper. Never link the raw graphimage URL in Discord - it carries your
-    API key. This downloads to a temp file and reads the bytes back.
+    Fetch a Keepa price-history graph PNG via the direct REST endpoint
+    (not the library helper - its domain handling for this endpoint isn't
+    documented, and we need to guarantee the GBP/UK-priced graph, not USD).
+    Never link this URL directly in Discord - it carries your API key.
     """
-    tmp_path = f"/tmp/graph_{asin}.png"
+    params = {
+        "key": KEEPA_API_KEY,
+        "domain": domain_id,   # numeric domainId - 2 = UK
+        "asin": asin,
+        "salesrank": 1,
+        "bb": 1,
+        "range": 90,
+        "width": 720,
+        "height": 320,
+    }
     try:
-        api.download_graph_image(asin, tmp_path, wait=True)
-        with open(tmp_path, "rb") as f:
-            return f.read()
+        r = requests.get("https://api.keepa.com/graphimage", params=params, timeout=20)
+        r.raise_for_status()
+        return r.content
     except Exception as e:
         print(f"  [!] Graph image fetch failed for {asin}: {e}")
         return None
 
-def send_discord_alert(country, source_product, uk_product, calc, ean, seller_count=None):
+def send_discord_alert(country, source_product, uk_product, calc, ean, seller_count=None, monthly_sold=None):
     title = source_product.get("title", "Unknown product")
     source_asin = source_product.get("asin")
     uk_asin = uk_product.get("asin")
@@ -290,6 +371,7 @@ def send_discord_alert(country, source_product, uk_product, calc, ean, seller_co
             {"name": "ROI", "value": f"{calc['roi_pct']}%", "inline": True},
             {"name": "Margin", "value": f"{calc['margin_pct']}%", "inline": True},
             {"name": "UK Sellers", "value": str(seller_count) if seller_count is not None else "?", "inline": True},
+            {"name": "Bought/mo", "value": str(monthly_sold) if monthly_sold is not None else "?", "inline": True},
             spacer,
             {"name": "Source ASIN", "value": f"`{source_asin}`", "inline": True},
             {"name": "UK ASIN", "value": f"`{uk_asin}`", "inline": True},
@@ -310,7 +392,7 @@ def send_discord_alert(country, source_product, uk_product, calc, ean, seller_co
         embed["thumbnail"] = {"url": thumb}
 
     files = None
-    graph_bytes = fetch_graph_image_bytes(uk_asin, DOMAIN_UK)
+    graph_bytes = fetch_graph_image_bytes(uk_asin, DOMAIN_IDS[DOMAIN_UK])
     if graph_bytes:
         embed["image"] = {"url": "attachment://graph.png"}
         files = {"file": ("graph.png", graph_bytes, "image/png")}
@@ -363,32 +445,42 @@ def process_country(country, domain, state):
             continue
 
         for uk_product in uk_matches:
-            uk_sell_price = get_current_buybox_price(uk_product) or get_avg_price(uk_product)
+            root_category = get_root_category_name(uk_product)
+            if not root_category or root_category.strip().lower() not in ALLOWED_ROOT_CATEGORIES:
+                print(f"  skip: {asin} (EAN {ean}) - category '{root_category}' not in allowed list")
+                continue
+
+            uk_sell_price = get_strict_buybox_price(uk_product)
             if uk_sell_price is None:
+                print(f"  skip: {asin} (EAN {ean}) - UK listing has no live buy box, skipping unreliable price")
                 continue
 
             calc = calc_profit(buy_price, uk_sell_price)
             seller_count = get_seller_count(uk_product)
+            monthly_sold = get_monthly_sold(uk_product)
 
             title_short = source_product.get("title", "")[:55]
-            print(f"  eval: {title_short} | buy=£{calc['buy_gbp_net']} "
+            print(f"  eval: {title_short} | cat={root_category} | buy=£{calc['buy_gbp_net']} "
                   f"sell=£{calc['sell_gbp_gross']} profit=£{calc['profit']} "
                   f"roi={calc['roi_pct']}% margin={calc['margin_pct']}% "
-                  f"sellers={seller_count}")
+                  f"sellers={seller_count} sold/mo={monthly_sold}")
 
             sellers_ok = (seller_count is not None
                           and MIN_SELLERS <= seller_count <= MAX_SELLERS)
+            sold_ok = (monthly_sold is not None and monthly_sold >= MIN_MONTHLY_SOLD)
 
             passes = (calc["profit"] >= MIN_PROFIT_GBP
                       and calc["roi_pct"] >= MIN_ROI_PCT
                       and calc["margin_pct"] >= MIN_MARGIN_PCT
-                      and sellers_ok)
+                      and sellers_ok
+                      and sold_ok)
 
             if passes or DEBUG_FORCE_ALERT:
                 if not passes:
                     print("  [DEBUG_FORCE_ALERT] sending despite failing filters")
-                print(f"  MATCH: {title_short} profit=£{calc['profit']} roi={calc['roi_pct']}% sellers={seller_count}")
-                send_discord_alert(country, source_product, uk_product, calc, ean, seller_count)
+                print(f"  MATCH: {title_short} profit=£{calc['profit']} roi={calc['roi_pct']}% "
+                      f"sellers={seller_count} sold/mo={monthly_sold}")
+                send_discord_alert(country, source_product, uk_product, calc, ean, seller_count, monthly_sold)
                 state[state_key] = {
                     "buy_price": buy_price,
                     "uk_asin": uk_product.get("asin"),
