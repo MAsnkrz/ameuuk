@@ -5,9 +5,10 @@ Scans Amazon FR / DE / IT / ES for deals (via Keepa's Deals feed), matches
 each deal to its UK ASIN via EAN/UPC/GTIN, pulls current UK pricing, runs
 your profitability filter, and posts qualifying leads to Discord.
 
-Mirrors the structure of your Very Cosmetics / Cherry Cosmetics monitors:
-state-file dedupe + Discord embed alerts, designed to run on a GitHub
-Actions cron.
+Uses the official `keepa` Python library (https://keepaapi.readthedocs.io)
+rather than raw REST calls - it handles the token bucket automatically
+(blocks and waits for tokens as needed) and returns correctly-parsed
+dictionaries, so we don't have to hand-roll throttling or guess field names.
 
 ENV VARS REQUIRED (set as GitHub Actions secrets):
     KEEPA_API_KEY
@@ -23,6 +24,7 @@ import os
 import json
 import time
 import requests
+import keepa
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -34,34 +36,32 @@ from urllib.parse import quote
 KEEPA_API_KEY = os.environ["KEEPA_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
-# Keepa domainId per marketplace
-DOMAIN_UK = 2
-SOURCE_DOMAINS = {
-    "France": 4,
-    "Germany": 3,
-    "Italy": 8,
-    "Spain": 9,
-}
+api = keepa.Keepa(KEEPA_API_KEY)
 
-# Deals feed filter — see Keepa docs for full selection schema.
-# priceTypes: 0 = Amazon price, 1 = New (3rd party/FBA), 2 = Used, 3 = Sales rank drop, 18 = Warehouse
-# We default to "New" FBA-eligible price drops, min 15% drop, seen in last 24h.
-DEALS_SELECTION_TEMPLATE = {
+DOMAIN_UK = "GB"
+SOURCE_DOMAINS = {
+    "France": "FR",
+    "Germany": "DE",
+    "Italy": "IT",
+    "Spain": "ES",
+}
+DOMAIN_TLD = {"France": "fr", "Germany": "de", "Italy": "it", "Spain": "es"}
+
+# Deals feed filter — see https://keepaapi.readthedocs.io for full schema.
+# priceTypes: 0 = Amazon, 1 = New (3rd party/FBA), 2 = Used, 18 = Warehouse
+DEALS_PARAMS_TEMPLATE = {
     "page": 0,
-    "domainId": None,          # filled in per-country
     "priceTypes": [1],
     "deltaPercentRange": [15, 100],   # min 15% price drop
-    "dateRange": 1,             # 0 = day, 1 = 3 days, 2 = week
+    "dateRange": 1,                    # 0 = day, 1 = 3 days, 2 = week
     "isRangeEnabled": True,
     "isFilterEnabled": True,
-    "isFBASupported": True,
-    "sortType": 4,               # sort by biggest % drop
-    "perPage": 20,
+    "sortType": 4,                     # sort by biggest % drop
 }
 
 # Hard cap on how many deals get fully processed (product lookup + EAN
-# cross-check + profit calc) per country per run. This is the real lever
-# on token spend - lower this further if you're still hitting 429s.
+# cross-check + profit calc) per country per run - the real lever on token
+# spend. Lower this if you're still hitting rate limits.
 MAX_DEALS_PER_COUNTRY = 15
 
 # Since Amazon applies UK VAT (OSS) on EU cross-border sales to your UK VAT
@@ -76,7 +76,7 @@ REFERRAL_FEE_RATE = 0.15     # most categories; override per-category if needed
 FBA_FEE_FLAT_ESTIMATE = 3.50 # £, small-standard placeholder — refine per ASIN/size tier
 
 # Profitability thresholds — mirror your existing filters
-MIN_PROFIT_GBP = 2.00
+MIN_PROFIT_GBP = 3.00
 MIN_ROI_PCT = 20.0
 MIN_MARGIN_PCT = 10.0
 
@@ -90,7 +90,6 @@ DEBUG_FORCE_ALERT = os.environ.get("DEBUG_FORCE_ALERT", "false").lower() == "tru
 FX_BUFFER_PCT = 1.5
 
 STATE_FILE = Path(__file__).parent / "seen_deals.json"
-KEEPA_BASE = "https://api.keepa.com"
 
 # ---------------------------------------------------------------------------
 # STATE (dedupe so we don't re-alert the same EAN+country every run)
@@ -105,83 +104,55 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 # ---------------------------------------------------------------------------
-# KEEPA CALLS
+# KEEPA CALLS (via the official library — wait=True handles token pacing)
 # ---------------------------------------------------------------------------
 
-def keepa_get(path, params, retries=3):
-    params = {**params, "key": KEEPA_API_KEY}
-    for attempt in range(retries):
-        r = requests.get(f"{KEEPA_BASE}/{path}", params=params, timeout=30)
-        if r.status_code == 429:
-            wait = 45 * (attempt + 1)
-            print(f"  [429] Rate limited, waiting {wait}s before retry...")
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
-        data = r.json()
-        tokens_left = data.get("tokensLeft")
-        # Confirmed refill rate: 21 tokens/min ≈ 1 token per ~2.9s sustainably.
-        # Pace every call at 3s so we never out-run the refill during a run,
-        # and only hard-pause if we've genuinely hit near-zero.
-        if tokens_left is not None and tokens_left < 5:
-            wait = 15
-            print(f"  [!] Very low tokens ({tokens_left}), pausing {wait}s...")
-            time.sleep(wait)
-        else:
-            time.sleep(3)
-        return data
-    raise requests.exceptions.HTTPError(f"429 persisted after {retries} retries on {path}")
+def fetch_deals(domain):
+    deal_parms = dict(DEALS_PARAMS_TEMPLATE)
+    result = api.deals(deal_parms, domain=domain, wait=True)
+    return result.get("dr", [])
 
-def fetch_deals(domain_id):
-    selection = dict(DEALS_SELECTION_TEMPLATE)
-    selection["domainId"] = domain_id
-    data = keepa_get("deal", {"selection": json.dumps(selection)})
-    return data.get("deals", {}).get("dr", [])
-
-def fetch_product_by_asin(asin, domain_id, stats_days=90):
-    data = keepa_get("product", {
-        "domain": domain_id,
-        "asin": asin,
-        "stats": stats_days,
-        "offers": 20,
-    })
-    products = data.get("products", [])
+def fetch_product_by_asin(asin, domain):
+    products = api.query(asin, domain=domain, stats=90, offers=20,
+                          history=False, wait=True, progress_bar=False)
     return products[0] if products else None
 
-def fetch_products_by_code(code, domain_id, stats_days=90):
+def fetch_products_by_code(code, domain):
     """Look up product(s) by EAN/UPC/GTIN on a given marketplace."""
-    data = keepa_get("product", {
-        "domain": domain_id,
-        "code": code,
-        "stats": stats_days,
-    })
-    return data.get("products", [])
+    products = api.query(code, domain=domain, stats=90, history=False,
+                          product_code_is_asin=False, wait=True, progress_bar=False)
+    return products
 
 # ---------------------------------------------------------------------------
 # PRICE HELPERS
 # ---------------------------------------------------------------------------
 
-def keepa_price_to_float(cents):
-    if cents is None or cents < 0:
-        return None
-    return round(cents / 100, 2)
-
 def get_current_buybox_price(product):
     stats = product.get("stats") or {}
-    current = stats.get("current") or []
-    # index 18 = buy box price in the "current" stats array
-    if len(current) > 18:
-        return keepa_price_to_float(current[18])
-    # fallback: NEW price, index 1
-    if len(current) > 1:
-        return keepa_price_to_float(current[1])
+    current = stats.get("current") or {}
+    if isinstance(current, dict):
+        for key in ("BUY_BOX_SHIPPING", "NEW", "AMAZON"):
+            val = current.get(key)
+            if val is not None and val >= 0:
+                return round(val / 100, 2) if val > 1000 else round(val, 2)
+    elif isinstance(current, list):
+        for idx in (18, 1):
+            if len(current) > idx and current[idx] and current[idx] > 0:
+                return round(current[idx] / 100, 2)
     return None
 
-def get_avg_price(product, field_index=18):
+def get_avg_price(product):
     stats = product.get("stats") or {}
-    avg90 = stats.get("avg90") or []
-    if len(avg90) > field_index:
-        return keepa_price_to_float(avg90[field_index])
+    avg = stats.get("avg90") or {}
+    if isinstance(avg, dict):
+        for key in ("BUY_BOX_SHIPPING", "NEW", "AMAZON"):
+            val = avg.get(key)
+            if val is not None and val >= 0:
+                return round(val / 100, 2) if val > 1000 else round(val, 2)
+    elif isinstance(avg, list):
+        for idx in (18, 1):
+            if len(avg) > idx and avg[idx] and avg[idx] > 0:
+                return round(avg[idx] / 100, 2)
     return None
 
 def get_primary_ean(product):
@@ -238,35 +209,6 @@ def calc_profit(buy_price_eur, sell_price_gbp):
 # DISCORD ALERT
 # ---------------------------------------------------------------------------
 
-GRAPH_BASE = "https://api.keepa.com/graphimage"
-
-def fetch_graph_image(asin, domain_id, days=90):
-    """
-    Fetch a Keepa price-history graph PNG for an ASIN.
-    NOTE: never pass this URL directly into a Discord embed - it contains
-    your API key. Always download the bytes here and upload as a Discord
-    file attachment instead (see send_discord_alert).
-    Cached by Keepa for 90 min per identical param set - re-requesting the
-    same graph within that window doesn't cost extra tokens.
-    """
-    params = {
-        "key": KEEPA_API_KEY,
-        "domain": domain_id,
-        "asin": asin,
-        "salesrank": 1,
-        "bb": 1,          # buy box line
-        "range": days,
-        "width": 720,
-        "height": 320,
-    }
-    try:
-        r = requests.get(GRAPH_BASE, params=params, timeout=20)
-        r.raise_for_status()
-        return r.content  # raw PNG bytes
-    except Exception as e:
-        print(f"  [!] Graph image fetch failed for {asin}: {e}")
-        return None
-
 def sas_ean(ean, cost_inc):
     return f"https://sas.selleramp.com/sas/lookup/?search_term={ean}&sas_cost_price={cost_inc:.2f}"
 
@@ -282,6 +224,21 @@ def get_thumbnail_url(product):
     if not first_image:
         return None
     return f"https://images-na.ssl-images-amazon.com/images/I/{first_image}"
+
+def fetch_graph_image_bytes(asin, domain):
+    """
+    Download a Keepa price-history graph PNG via the library's built-in
+    helper. Never link the raw graphimage URL in Discord - it carries your
+    API key. This downloads to a temp file and reads the bytes back.
+    """
+    tmp_path = f"/tmp/graph_{asin}.png"
+    try:
+        api.download_graph_image(asin, tmp_path, wait=True)
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        print(f"  [!] Graph image fetch failed for {asin}: {e}")
+        return None
 
 def send_discord_alert(country, source_product, uk_product, calc, ean):
     title = source_product.get("title", "Unknown product")
@@ -320,10 +277,8 @@ def send_discord_alert(country, source_product, uk_product, calc, ean):
     if thumb:
         embed["thumbnail"] = {"url": thumb}
 
-    # Fetch the UK price-history graph and attach it as a file — never link
-    # the raw graphimage URL, since it carries your Keepa API key.
     files = None
-    graph_bytes = fetch_graph_image(uk_asin, DOMAIN_UK)
+    graph_bytes = fetch_graph_image_bytes(uk_asin, DOMAIN_UK)
     if graph_bytes:
         embed["image"] = {"url": "attachment://graph.png"}
         files = {"file": ("graph.png", graph_bytes, "image/png")}
@@ -334,16 +289,14 @@ def send_discord_alert(country, source_product, uk_product, calc, ean):
     else:
         requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
 
-DOMAIN_TLD = {"France": "fr", "Germany": "de", "Italy": "it", "Spain": "es"}
-
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
-def process_country(country, domain_id, state):
+def process_country(country, domain, state):
     """Returns True if DEBUG_FORCE_ALERT fired during this call."""
     print(f"[{country}] fetching deals...")
-    deals = fetch_deals(domain_id)
+    deals = fetch_deals(domain)
     print(f"[{country}] {len(deals)} deals returned, processing up to {MAX_DEALS_PER_COUNTRY}")
     deals = deals[:MAX_DEALS_PER_COUNTRY]
 
@@ -352,26 +305,29 @@ def process_country(country, domain_id, state):
         if not asin:
             continue
 
-        source_product = fetch_product_by_asin(asin, domain_id)
+        source_product = fetch_product_by_asin(asin, domain)
         if not source_product:
+            print(f"  skip: {asin} - no product data returned")
             continue
 
         ean = get_primary_ean(source_product)
         if not ean:
-            continue  # can't cross-match without a barcode
+            print(f"  skip: {asin} - no EAN, can't cross-match to UK")
+            continue
 
         state_key = f"{country}:{ean}"
         buy_price = get_current_buybox_price(source_product) or get_avg_price(source_product)
         if buy_price is None:
+            print(f"  skip: {asin} - no usable price found")
             continue
 
-        # dedupe: skip if we've already alerted this EAN at this price band recently
         prev = state.get(state_key)
         if prev and abs(prev.get("buy_price", 0) - buy_price) < 0.5:
             continue
 
         uk_matches = fetch_products_by_code(ean, DOMAIN_UK)
         if not uk_matches:
+            print(f"  skip: {asin} (EAN {ean}) - no UK match found")
             continue
 
         for uk_product in uk_matches:
@@ -381,9 +337,6 @@ def process_country(country, domain_id, state):
 
             calc = calc_profit(buy_price, uk_sell_price)
 
-            # Always log what was evaluated, pass or fail - this is what lets
-            # you see WHY nothing is alerting (too-low margin, near misses,
-            # etc.) instead of just silence.
             title_short = source_product.get("title", "")[:55]
             print(f"  eval: {title_short} | buy=£{calc['buy_gbp_net']} "
                   f"sell=£{calc['sell_gbp_gross']} profit=£{calc['profit']} "
@@ -406,25 +359,23 @@ def process_country(country, domain_id, state):
                     "roi_pct": calc["roi_pct"],
                 }
                 if DEBUG_FORCE_ALERT:
-                    return True  # only fire the one forced test alert per run
-
-        time.sleep(1)  # be gentle on token budget / rate limits
+                    return True
 
     return False
 
 
 def main():
     state = load_state()
-    for country, domain_id in SOURCE_DOMAINS.items():
+    for country, domain in SOURCE_DOMAINS.items():
+        debug_fired = False
         try:
-            process_country(country, domain_id, state)
+            debug_fired = process_country(country, domain, state)
         except Exception as e:
             print(f"[{country}] ERROR: {e}")
-        save_state(state)  # persist after each country in case a later one fails
-        if DEBUG_FORCE_ALERT and any(state.values()):
+        save_state(state)
+        if debug_fired:
             print("[DEBUG_FORCE_ALERT] test alert sent, stopping run early.")
             break
-        time.sleep(15)  # spread load across the run rather than bursting
     save_state(state)
 
 
