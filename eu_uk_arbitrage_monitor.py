@@ -43,7 +43,7 @@ if not DISCORD_WEBHOOK_URL or not DISCORD_WEBHOOK_URL.startswith("http"):
         "your current webhook URL, with no leading/trailing whitespace."
     )
 
-api = keepa.Keepa(KEEPA_API_KEY)
+api = keepa.Keepa(KEEPA_API_KEY, timeout=30)
 
 DOMAIN_UK = "GB"
 SOURCE_DOMAINS = {
