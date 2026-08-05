@@ -73,7 +73,7 @@ DEALS_PARAMS_TEMPLATE = {
 # Hard cap on how many deals get fully processed (product lookup + EAN
 # cross-check + profit calc) per country per run - the real lever on token
 # spend. Lower this if you're still hitting rate limits.
-MAX_DEALS_PER_COUNTRY = 15
+MAX_DEALS_PER_COUNTRY = 50
 
 # Since Amazon applies UK VAT (OSS) on EU cross-border sales to your UK VAT
 # number, treat the EU buy price like a domestic buy: strip VAT to get net
