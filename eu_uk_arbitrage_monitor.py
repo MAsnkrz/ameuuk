@@ -56,8 +56,13 @@ DEALS_SELECTION_TEMPLATE = {
     "isFilterEnabled": True,
     "isFBASupported": True,
     "sortType": 4,               # sort by biggest % drop
-    "perPage": 50,
+    "perPage": 20,
 }
+
+# Hard cap on how many deals get fully processed (product lookup + EAN
+# cross-check + profit calc) per country per run. This is the real lever
+# on token spend - lower this further if you're still hitting 429s.
+MAX_DEALS_PER_COUNTRY = 15
 
 # Since Amazon applies UK VAT (OSS) on EU cross-border sales to your UK VAT
 # number, treat the EU buy price like a domestic buy: strip VAT to get net
@@ -102,17 +107,22 @@ def keepa_get(path, params, retries=3):
     for attempt in range(retries):
         r = requests.get(f"{KEEPA_BASE}/{path}", params=params, timeout=30)
         if r.status_code == 429:
-            wait = 60 * (attempt + 1)
+            wait = 45 * (attempt + 1)
             print(f"  [429] Rate limited, waiting {wait}s before retry...")
             time.sleep(wait)
             continue
         r.raise_for_status()
         data = r.json()
-        # Keepa returns tokensLeft in every response - throttle proactively
         tokens_left = data.get("tokensLeft")
-        if tokens_left is not None and tokens_left < 20:
-            print(f"  [!] Low tokens ({tokens_left}), pausing 30s to let them refill...")
-            time.sleep(30)
+        # Confirmed refill rate: 21 tokens/min ≈ 1 token per ~2.9s sustainably.
+        # Pace every call at 3s so we never out-run the refill during a run,
+        # and only hard-pause if we've genuinely hit near-zero.
+        if tokens_left is not None and tokens_left < 5:
+            wait = 15
+            print(f"  [!] Very low tokens ({tokens_left}), pausing {wait}s...")
+            time.sleep(wait)
+        else:
+            time.sleep(3)
         return data
     raise requests.exceptions.HTTPError(f"429 persisted after {retries} retries on {path}")
 
@@ -327,7 +337,8 @@ DOMAIN_TLD = {"France": "fr", "Germany": "de", "Italy": "it", "Spain": "es"}
 def process_country(country, domain_id, state):
     print(f"[{country}] fetching deals...")
     deals = fetch_deals(domain_id)
-    print(f"[{country}] {len(deals)} deals returned")
+    print(f"[{country}] {len(deals)} deals returned, processing up to {MAX_DEALS_PER_COUNTRY}")
+    deals = deals[:MAX_DEALS_PER_COUNTRY]
 
     for deal in deals:
         asin = deal.get("asin")
@@ -394,4 +405,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
