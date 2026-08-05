@@ -47,6 +47,10 @@ SOURCE_DOMAINS = {
 }
 DOMAIN_TLD = {"France": "fr", "Germany": "de", "Italy": "it", "Spain": "es"}
 
+# Keepa's deals() endpoint requires domainId INSIDE the deal_parms dict
+# itself (not just the separate domain= kwarg) - numeric IDs per Keepa docs.
+DOMAIN_IDS = {"GB": 2, "DE": 3, "FR": 4, "IT": 8, "ES": 9}
+
 # Deals feed filter — see https://keepaapi.readthedocs.io for full schema.
 # priceTypes: 0 = Amazon, 1 = New (3rd party/FBA), 2 = Used, 18 = Warehouse
 DEALS_PARAMS_TEMPLATE = {
@@ -109,6 +113,7 @@ def save_state(state):
 
 def fetch_deals(domain):
     deal_parms = dict(DEALS_PARAMS_TEMPLATE)
+    deal_parms["domainId"] = DOMAIN_IDS[domain]
     result = api.deals(deal_parms, domain=domain, wait=True)
     return result.get("dr", [])
 
