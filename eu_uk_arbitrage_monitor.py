@@ -62,7 +62,7 @@ DOMAIN_IDS = {"GB": 2, "DE": 3, "FR": 4, "IT": 8, "ES": 9}
 # priceTypes: 0 = Amazon, 1 = New (3rd party/FBA), 2 = Used, 18 = Warehouse
 DEALS_PARAMS_TEMPLATE = {
     "page": 0,
-    "priceTypes": [1],
+    "priceTypes": [0],  # 0 = sold by Amazon directly - excludes 3rd party FBA/FBM
     "deltaPercentRange": [15, 100],   # min 15% price drop
     "dateRange": 1,                    # 0 = day, 1 = 3 days, 2 = week
     "isRangeEnabled": True,
@@ -115,6 +115,7 @@ ALLOWED_ROOT_CATEGORIES = {
     "grocery",
     "toys & games", "toys and games", "toys",
     "office products", "stationery & office supplies", "stationery and office supplies",
+    "diy & tools", "diy and tools", "tools & home improvement", "tools and home improvement",
 }
 
 # Set to True for a one-off test run: fires a real Discord alert on the FIRST
@@ -164,6 +165,23 @@ def fetch_products_by_code(code, domain):
 # ---------------------------------------------------------------------------
 # PRICE HELPERS
 # ---------------------------------------------------------------------------
+
+def get_strict_amazon_price(product):
+    """
+    Source (EU) buy price MUST be Amazon's own current price - not a 3rd
+    party buy box that happened to win, even if the deal itself was
+    Amazon-sold. Returns None if Amazon isn't currently the active seller.
+    """
+    stats = product.get("stats") or {}
+    current = stats.get("current") or {}
+    if isinstance(current, dict):
+        val = current.get("AMAZON")
+        if val is not None and val >= 0:
+            return round(val / 100, 2) if val > 1000 else round(val, 2)
+    elif isinstance(current, list):
+        if len(current) > 0 and current[0] and current[0] > 0:
+            return round(current[0] / 100, 2)
+    return None
 
 def get_current_buybox_price(product):
     stats = product.get("stats") or {}
@@ -424,15 +442,24 @@ def process_country(country, domain, state):
             print(f"  skip: {asin} - no product data returned")
             continue
 
+        # Check category on the source listing FIRST - same product is
+        # virtually always the same category cross-market, so this filters
+        # out Books/Pet Supplies/etc. before spending tokens on the EAN
+        # cross-check and UK product lookup for something we'd reject anyway.
+        source_category = get_root_category_name(source_product)
+        if not source_category or source_category.strip().lower() not in ALLOWED_ROOT_CATEGORIES:
+            print(f"  skip: {asin} - category '{source_category}' not in allowed list (checked pre-EAN)")
+            continue
+
         ean = get_primary_ean(source_product)
         if not ean:
             print(f"  skip: {asin} - no EAN, can't cross-match to UK")
             continue
 
         state_key = f"{country}:{ean}"
-        buy_price = get_current_buybox_price(source_product) or get_avg_price(source_product)
+        buy_price = get_strict_amazon_price(source_product)
         if buy_price is None:
-            print(f"  skip: {asin} - no usable price found")
+            print(f"  skip: {asin} - Amazon isn't the current seller (no live Amazon price)")
             continue
 
         prev = state.get(state_key)
